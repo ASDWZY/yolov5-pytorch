@@ -1,0 +1,21 @@
+train_dataset: datasets/train_fire.txt
+val_dataset: datasets/val_fire.txt
+
+names:
+  [fire]
+#  [ fire,smoke ]
+
+transforms: Transforms([RandomHorizontalFlip(), RandomRotate(10.0), RandomHSV()])
+
+epochs: 100
+close_mosaic: 10
+batch_size: 16
+
+patience: 50
+
+save_period: 10
+save_dir: "models/train/"
+log_dir: "logs"
+
+mosaic: 0.4
+mixup: 0.1
