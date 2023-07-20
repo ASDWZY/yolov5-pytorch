@@ -1,39 +1,13 @@
+import numpy as np
 from matplotlib import pyplot as plt
 
 from YOLO import YOLO, ImageResult
 from datasets.YoloTransforms import *
 from datasets.YoloDataset import YoloDataset
 from yolov5.utils import LOGGER
-
-def show_training_layer(img,stride,  imgsz):
-    # stride = model.model[-1].stride[layer_idx]
-
-    fig = plt.imshow(img)
-    fig.axes.grid()
-    fig.axes.set_xticks(np.arange(0, imgsz, stride))
-    fig.axes.set_yticks(np.arange(0, imgsz, stride))
-
-    def draw_box_center(box, c="r"):
-        center_box = box_corner_to_center(box).cpu()
-        center_x, center_y = center_box[0], center_box[1]
-        fig.axes.plot(center_x, center_y, marker="o", c=c)
-
-    for i, target in enumerate(targets):
-        box = target[:4]
-        cls = int(target[4])
-        label = self.names[cls] + f" {i}"
-        draw_box(fig.axes, box,
-                 label, 'r')
-        draw_box_center(box)
-
-    positive_idx = gts_map > -1
-    anchors = prediction[positive_idx].reshape(-1, len(self.names) + 5)
-    gt_idxs = gts_map[positive_idx]
-    for i, anchor in zip(gt_idxs, anchors):
-        box = box_center_to_corner(anchor[:4])
-        draw_box(fig.axes, box,
-                 f"{int(i)} {round(float(anchor[4]), 4)}", 'g')
-        draw_box_center(box.detach(), "g")
+from yolov5.utils.box import Boxes, squeeze_with_indices
+from yolov5.utils.image import Image
+from yolov5.utils.train import Assigner
 
 
 class DatasetEvaluator:
@@ -52,8 +26,10 @@ class DatasetEvaluator:
             yield data
 
     def show(self, cutoff=None):
+        i = 0
         for imgs, targets in self.get_iter(cutoff):
             for img, target in zip(imgs, targets):
+                i += 1
                 fig = plt.imshow(img.data)
                 target.plot(fig.axes, self.model.names, ["r"] * len(self.model.names))
                 plt.show()
@@ -67,9 +43,45 @@ class DatasetEvaluator:
                 target.plot(fig.axes, self.model.names, ["r"] * len(self.model.names))
                 plt.show()
 
-    def show_training(self, cutoff=30):
-        self.model.train_mode()
+    def show_assignment_layer(self, img: Image, matched_targets, pred, stride):
+        fig = img.letterbox(self.model.imgsz).plot(False)
+        fig.axes.grid()
+        fig.axes.set_xticks(np.arange(0, self.model.imgsz, int(stride)))
+        fig.axes.set_yticks(np.arange(0, self.model.imgsz, int(stride)))
 
+        if matched_targets is None:
+            plt.show()
+            return
+
+        targets, bi, ai, xi, yi = matched_targets.split([5, 1, 1, 1, 1], dim=-1)
+        targets = Boxes(targets, has_conf=False)
+        xi, yi = xi.clamp(0, pred.shape[3] - 1), yi.clamp(0, pred.shape[2] - 1)
+
+        names = self.model.names
+        targets.plot(fig.axes, names, ["r"] * len(names))
+
+        pred = Boxes(pred[bi, ai, yi, xi, :5].view(-1, 5), is_xywh=True)
+        pred[:, 4] = pred.conf.sigmoid()
+
+        pred.plot(fig.axes, names, ["g"] * len(names))
+
+        plt.show()
+
+    def show_assignment(self, cutoff=30):
+        self.model.train_mode()
+        assigner = Assigner()
+        strides = self.model.get_strides()
+        anchors = self.model.get_anchors()
+        for imgs, targets in self.get_iter(cutoff):
+            with torch.no_grad():
+                preds, targets = self.model.train_process(imgs, targets)
+
+            for layer_idx, pred in enumerate(preds):
+                stride = strides[layer_idx]
+                matched_targets = assigner(targets, stride, anchors[layer_idx])
+                for bi, img in enumerate(imgs):
+                    t = matched_targets[matched_targets[..., 5] == bi] if matched_targets is not None else None
+                    self.show_assignment_layer(img, t, pred, stride)
 
 
 if __name__ == '__main__':
@@ -83,10 +95,11 @@ if __name__ == '__main__':
     dataset = YoloDataset(path="datasets/train_fire.txt", input_size=640, augments=transforms, mosaic_prob=mosaic,
                           mixup_prob=mixup)
 
-
-    model = YOLO("models/train/best.pt", ["fire", "smoke"], device_id=0)
-
+    model = YOLO("models/train/best.pt", ["fire", "smoke"], device_id=-1)
+    # model.reset_num_classes()
+    # model.init_weights()
 
     evaluator = DatasetEvaluator(model, dataset, 1)
     # evaluator.show(30)
     evaluator.detect(30)
+    # evaluator.show_assignment(5)

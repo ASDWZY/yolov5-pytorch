@@ -66,18 +66,12 @@ class Timer:
         return ", ".join(new_formats)
 
 
-def check_dir(path, clear=False):
-    if not os.path.isdir(path):
-        root, _ = os.path.split(path)
-    else:
-        root = path
-    if not os.path.exists(root):
-        LOGGER.info(f"Path '{path}' does not exist,making dirs of '{root}'")
-        os.makedirs(root)
+def check_dir(dir, clear=False):
+    if not os.path.exists(dir):
+        os.makedirs(dir)
     elif clear:
-        LOGGER.info(f"Path '{path}' exists,clearing '{root}'")
-        rmtree(root)
-        os.makedirs(root)
+        rmtree(dir)
+        os.makedirs(dir)
 
 
 def check_packages(packages):

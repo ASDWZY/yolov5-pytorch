@@ -1,8 +1,12 @@
 import numpy as np
 import torch
-from typing import Optional
+from typing import Optional, List, Union
 import cv2
 from matplotlib import pyplot as plt
+
+
+def all_equal(x: list):
+    return len(set(x)) == 1
 
 
 def box_area(boxes):
@@ -85,15 +89,25 @@ class Boxes:
         return str(self)
 
     def __getitem__(self, item):
-        return self.data[item]
+        return self._new(self.data[item])
+
+    def __setitem__(self, key, value):
+        self.data[key] = value
 
     def __iter__(self):
         for d in self.data:
             yield self._new(d)
 
+    def reshape(self, *shape):
+        return self._new(self.data.reshape(*shape))
+
     @staticmethod
     def _stack(datas, axis):
         return torch.stack(datas, dim=axis)
+
+    @staticmethod
+    def _concat(datas, axis):
+        return torch.cat(datas, dim=axis)
 
     @property
     def device(self):
@@ -105,7 +119,7 @@ class Boxes:
 
     @property
     def shape(self):
-        return self.data.shape[:-1]
+        return self.data.shape
 
     @property
     def data_size(self):
@@ -151,6 +165,20 @@ class Boxes:
         return self.data[..., [1, 3]]
 
     @property
+    def center(self):
+        if self.is_xywh:
+            return self.data[..., :2]
+        x1, y1, x2, y2 = self.data[..., 0], self.data[..., 1], self.data[..., 2], self.data[..., 3]
+        return self._stack(((x1 + x2) / 2, (y1 + y2) / 2), -1)
+
+    @property
+    def wh(self):
+        if self.is_xywh:
+            return self.data[..., 2:4]
+        x1, y1, x2, y2 = self.data[..., 0], self.data[..., 1], self.data[..., 2], self.data[..., 3]
+        return self._stack((x2 - x1, y2 - y1), -1)
+
+    @property
     def cls_conf(self):
         return self.data[..., self._cls_idx:] if self.data_size > self._cls_idx else None
 
@@ -185,6 +213,9 @@ class Boxes:
     def copy(self):
         return self._new(self.data.clone())
 
+    def add_attrs(self, *attrs):
+        return self._new(self._concat((self.data, *attrs), -1))
+
     def to_xywh(self):
         if not self.is_xywh:
             self.is_xywh = True
@@ -197,9 +228,6 @@ class Boxes:
             cx, cy, w, h = self.data[..., 0], self.data[..., 1], self.data[..., 2], self.data[..., 3]
             w2, h2 = w / 2, h / 2
             self.data[..., :4] = self._stack((cx - w2, cy - h2, cx + w2, cy + h2), -1)
-
-    def select(self, idx):
-        return self._new(self.data[idx])
 
     def select_by_conf(self, conf_thresh):
         if self.has_conf:
@@ -215,7 +243,7 @@ class Boxes:
         conf = conf[mask].unsqueeze(-1)
         if conf.shape[0] == 0:
             return self._new()
-        return self.__class__(torch.cat((boxes[mask][:, :4], conf, classes[mask].unsqueeze(-1)), dim=-1),
+        return self.__class__(self._concat((boxes[mask][:, :4], conf, classes[mask].unsqueeze(-1)), -1),
                               is_xywh=self.is_xywh)
 
     def clip(self, w, h=None):
@@ -240,15 +268,22 @@ class Boxes:
                 break
             iou = self.iou_mat(self.__class__(boxes[i].view(1, 4)), self.__class__(boxes[ranking_idxs[1:]])).view(-1)
             ranking_idxs = ranking_idxs[1:][iou <= nms_thresh]
-        return self.select(torch.tensor(keep, device=self.device))
+        return self[torch.tensor(keep, device=self.device)]
 
-    def reverse_letterbox(self, img_shape, input_size):
+    def letterbox(self, img_shape, imgsz):
         img_h, img_w = img_shape
-        scaling_factor = input_size / max(img_shape)
+        factor = imgsz / max(img_shape)
+        self.data[..., :4] *= factor
+        self.data[..., [0, 2]] += (imgsz - factor * img_w) // 2
+        self.data[..., [1, 3]] += (imgsz - factor * img_h) // 2
+
+    def reverse_letterbox(self, img_shape, imgsz):
+        img_h, img_w = img_shape
+        factor = imgsz / max(img_shape)
         self.to_xyxy()
-        self.data[..., [0, 2]] -= (input_size - scaling_factor * img_w) // 2
-        self.data[..., [1, 3]] -= (input_size - scaling_factor * img_h) // 2
-        self.data[..., :4] /= scaling_factor
+        self.data[..., [0, 2]] -= (imgsz - factor * img_w) // 2
+        self.data[..., [1, 3]] -= (imgsz - factor * img_h) // 2
+        self.data[..., :4] /= factor
 
     def _get_box_label(self, box, names, colors, box_color=(0, 255, 0)):
         label = ""
@@ -294,6 +329,14 @@ class Boxes:
             axes.text(rect.xy[0], rect.xy[1], label,
                       va='center', ha='center', fontsize=9, color=label_color,
                       bbox=dict(facecolor=box_color, lw=0))
+
+    @classmethod
+    def concat(cls, x, axis=0):
+        ret_conf = all_equal([y.has_conf for y in x])
+        ret_xywh = all_equal([y.is_xywh for y in x])
+        if ret_conf and ret_xywh:
+            return cls(cls._concat([y.data for y in x], axis), is_xywh=x[0].is_xywh, has_conf=x[0].has_conf)
+        raise ValueError("has_conf and is_xywh of boxes for concatenation must be equal.")
 
     @property
     def box_area(self):
@@ -349,13 +392,13 @@ class NumpyBoxes(Boxes):
         if self.data_size < 4:
             raise Exception("The data size must be greater than 3")
 
-    @property
-    def device(self):
-        return None
-
     @staticmethod
     def _stack(datas, axis):
         return np.stack(datas, axis=axis)
+
+    @staticmethod
+    def _concat(datas, axis):
+        return np.concatenate(datas, axis=axis)
 
     @property
     def unique_classes(self):
@@ -384,7 +427,7 @@ class NumpyBoxes(Boxes):
         if boxes.shape[0] == 0:
             return self._new()
         shape = (*boxes.shape[:-1], 1)
-        return self.__class__(np.concatenate(
+        return self.__class__(self._concat(
             (boxes[:, :4], conf[mask].reshape(shape), np.argmax(boxes[..., self._cls_idx:], axis=-1).reshape(shape)),
             axis=-1), is_xywh=self.is_xywh)
 
@@ -411,7 +454,7 @@ class NumpyBoxes(Boxes):
             iou = self.iou_mat(self.__class__(boxes[i].reshape((1, 4))),
                                self.__class__(boxes[ranking_idxs[1:]])).reshape(-1)
             ranking_idxs = ranking_idxs[1:][iou <= nms_thresh]
-        return self.select(np.array(keep))
+        return self[np.array(keep)]
 
     @staticmethod
     def iou(b1, b2, eps=1e-7):
@@ -458,3 +501,15 @@ class NumpyBoxes(Boxes):
 
         enclose_area = enclose_wh[..., 0] * enclose_wh[..., 1]
         return iou - (enclose_area - union_area) / (enclose_area + eps)
+
+
+def squeeze_with_indices(xs: List[Union[Boxes, NumpyBoxes]]):
+    indices = []
+    for i, x in enumerate(xs):
+        indices += ([i] * len(x))
+    indices = torch.tensor(indices, device=x.device).view(-1, 1)
+    return x.concat(xs, 0).add_attrs(indices)
+
+
+if __name__ == '__main__':
+    print(all_equal([1, 1, 1, 2]))

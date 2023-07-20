@@ -56,15 +56,15 @@ class CrowdHuman(BaseDataset):
 
 class YoloDataset(data.Dataset):
 
-    def __init__(self, path, input_size, mosaic_prob=0.0, mixup_prob=0.0, names=None, augments=None):
-        with open(path, encoding="gbk") as txt_file:
-            datas = txt_file.readlines()
-        # try:
-        #     with open(path, encoding="gbk") as txt_file:
-        #         self.datas = txt_file.readlines()
-        # except:
-        #     with open(path) as txt_file:
-        #         self.datas = txt_file.readlines()
+    def __init__(self, path, input_size=640, mosaic_prob=0.0, mixup_prob=0.0, names=None, augments=None):
+        # with open(path, encoding="gbk") as txt_file:
+        #     datas = txt_file.readlines()
+        try:
+            with open(path, encoding="gbk") as txt_file:
+                datas = txt_file.readlines()
+        except UnicodeDecodeError:
+            with open(path) as txt_file:
+                datas = txt_file.readlines()
         self.names = datas[0].split(",")[:-1]
         if names is None:
             self._warn = True
@@ -81,17 +81,32 @@ class YoloDataset(data.Dataset):
         self._mosaic = Mosaic(target_shape=(input_size, input_size))
         self._mixup = Mixup()
 
-        self._augments = Transforms([Resize(input_size), LetterBox(input_size, input_size)])
         if augments:
-            self._augments = Transforms([augments]) + self._augments
+            self._augments = augments
+        else:
+            self._augments = Transforms([])
 
     def __len__(self):
         return len(self._datas)
 
+    def get_datas(self, idx):
+        data = self._datas[idx]
+        img_path, targets_str = data.split(" ::")
+        # print(img_path, os.path.exists(img_path))
+        img = Image.read(img_path).to_rgb()
+
+        targets_str = targets_str.split(" ")[1:]
+        targets = []
+        for target_str in targets_str:
+            x1, y1, x2, y2, cls = target_str.split(",")
+            cls = int(eval(cls))
+            if cls in self.classes:
+                targets.append([float(x1), float(y1), float(x2), float(y2), cls])
+        return img, img_path, targets
+
     def _get_datas(self, idx):
         data = self._datas[idx]
         img_path, targets_str = data.split(" ::")
-        # img = cv2.imread(img_path)[:, :, ::-1].astype(np.uint8)
         img = Image.read(img_path).rgb_data
         targets_str = targets_str.split(" ")[1:]
         targets = []

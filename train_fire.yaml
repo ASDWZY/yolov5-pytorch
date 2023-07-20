@@ -2,8 +2,8 @@ train_dataset: datasets/train_fire.txt
 val_dataset: datasets/val_fire.txt
 
 names:
-  [fire]
-#  [ fire,smoke ]
+#  [fire]
+  [ fire,smoke ]
 
 transforms: Transforms([RandomHorizontalFlip(), RandomRotate(10.0), RandomHSV()])
 
