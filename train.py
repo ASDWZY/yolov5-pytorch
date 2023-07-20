@@ -1,19 +1,14 @@
-import sys
-import time
+import shutil
 
-import torch.autograd
 from torch.utils.tensorboard import SummaryWriter
-
-# sys.path.append("..")
 
 from datasets.YoloTransforms import *
 from datasets.YoloDataset import YoloDataset
-from utils import LOGGER
 from utils.train import *
-from models.yolo import make_detect_weights, Detect
 import os
 
-from yolov5.utils.optimize import YoloOptimizer
+from utils.optimize import YoloOptimizer
+from yolov5.utils import Timer, check_dir
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
@@ -135,8 +130,8 @@ class FitMonitor:
             LOGGER.step(f"Early stopping with train_loss={float(train_l)}, val_loss={float(val_l)}")
             self.finish()
 
-        if check_loss(train_loss) or check_loss(val_loss):
-            return float("nan")
+        if check_loss(train_loss, "total_train_loss") or check_loss(val_loss, "total_val_loss"):
+            return
         fitness = train_l * self.train_proportion + val_l * (1 - self.train_proportion)
         self.save_model("last.pt", model, epoch, optimizer)
         if fitness < self.min_loss:
@@ -154,6 +149,41 @@ class FitMonitor:
         train_time = self.timer.get_interval_formats()
         LOGGER.step(f"\nFinished training. Trained for {train_time}")
         exit(0)
+
+
+class BatchTrainer:
+    def __init__(self, model: YOLO, loss: YoloLoss, epochs, amp):
+        self.model = model
+        self.loss = loss
+        self.epochs = epochs
+        self.amp = amp
+
+        self.timer = Timer()
+        self.train_loss = None
+        self.epoch = -1
+
+    def start(self):
+        if self.train_loss is None:
+            self.timer.reset()
+        self.epoch += 1
+        self.train_loss = 0.0
+
+    def _display_progress(self, i, num_batches, epoch):
+        train_time = self.timer.get_interval_formats()
+        print(f"\repoch {epoch + 1}/{self.epochs}   train_iter {i + 1}/{num_batches}   trained for {train_time}",
+              end="")
+
+    def __call__(self, data_loader):
+        for i, (imgs, targets) in enumerate(data_loader):
+            batch_size=len(targets)
+            self._display_progress(i, len(data_loader), self.epoch)
+            with torch.cuda.amp.autocast(self.amp):
+                predictions, targets = self.model.train_process(imgs, targets)
+                for layer_idx, prediction in enumerate(predictions):
+                    check_value(prediction, f"prediction_layer{layer_idx}")
+                loss = self.loss(predictions, targets, "batch_train_loss")
+                self.train_loss += loss.data
+                yield loss.sum()*batch_size
 
 
 class Trainer:
@@ -205,7 +235,7 @@ class Trainer:
                 f"Names of train_dataset: {train_dataset.names}, val_dataset: {val_dataset.names} and the cfg: {self.names} would better be equal.\n")
         self.datasets = {"train": train_dataset, "val": val_dataset}
 
-    def _setup_train(self, model, resume, freeze_epochs):
+    def _setup_train(self, resume, freeze_epochs):
         if self.model.device != torch.device("cpu") and self.cfg["benchmark"]:
             torch.backends.cudnn.benchmark = True
         if self.cfg["amp"]:
@@ -213,41 +243,29 @@ class Trainer:
 
         num_classes = len(self.names)
 
-        fit_monitor = FitMonitor(self.cfg["epochs"], self.cfg["save_dir"], self.cfg["save_period"], self.cfg["patience"])
+        fit_monitor = FitMonitor(self.cfg["epochs"], self.cfg["save_dir"], self.cfg["save_period"],
+                                 self.cfg["patience"])
         start_epoch = fit_monitor.start(self.model.model.ckpt, freeze_epochs, resume)
-        model.model[-1] = make_detect_weights(model.model[-1], num_classes)
+        self.model.model.attempt_reset_nc(num_classes)
 
         train_iter = self.datasets["train"].get_dataloader(self.cfg["batch_size"])
         val_iter = self.datasets["val"].get_dataloader(self.cfg["batch_size"])
 
-        optimizer = YoloOptimizer(model, self.cfg, len(train_iter))
+        optimizer = YoloOptimizer(self.base_model, self.cfg, len(train_iter))
         if resume:
             optimizer.check_resume(self.model.model.ckpt)
 
-        yolo_loss = YoloLoss(num_classes, self.model.imgsz)
+        yolo_loss = YoloLoss(self.model)
         return fit_monitor, train_iter, val_iter, optimizer, yolo_loss, start_epoch
 
     def train(self, freeze_epochs=0, resume=False):
         model = self.base_model
-        fit_monitor, train_iter, val_iter, optimizer, yolo_loss, start_epoch = self._setup_train(model, resume,
-                                                                                                freeze_epochs)
+        fit_monitor, train_iter, val_iter, optimizer, yolo_loss, start_epoch = self._setup_train(resume,
+                                                                                                 freeze_epochs)
         log_writer = YoloLogWriter(self.cfg["log_dir"], resume)
-
-        def train_batch(i, data):
-            imgs, targets = data
-            fit_monitor.display_progress(i, len(train_iter), epoch)
-
-            targets = [target.to(self.model.device).data for target in targets]
-            with torch.cuda.amp.autocast(self.cfg["amp"]):
-                predictions = model(self.model.preprocess(imgs))
-                for layer_idx, prediction in enumerate(predictions):
-                    check_value(prediction, f"prediction_layer{layer_idx}")
-                loss = yolo_loss(model, predictions, targets)
-                check_loss(loss)
-                return loss
+        batch_trainer = BatchTrainer(self.model, yolo_loss, self.cfg["epochs"], self.cfg["amp"])
 
         for epoch in range(start_epoch, self.cfg["epochs"]):
-
             state = fit_monitor.check_epoch(epoch, freeze_epochs, self.cfg["close_mosaic"])
             if state == "freeze":
                 LOGGER.step("Freezing model")
@@ -260,10 +278,12 @@ class Trainer:
             elif state == "close mosaic":
                 LOGGER.step("Closing Mosaic")
                 train_iter = self._close_mosaic()
-            train_loss = optimizer.optimize(train_batch, model, enumerate(train_iter), self.cfg["batch_size"])
+
+            batch_trainer.start()
+            optimizer.optimize(batch_trainer(train_iter), model, self.cfg["batch_size"])
 
             val_loss = self.dataset_loss(yolo_loss, val_iter)
-            train_loss /= len(train_iter)
+            train_loss = batch_trainer.train_loss / len(train_iter)
 
             log_writer.write(epoch, train_loss, val_loss, optimizer.lrs)
             fit_monitor.step(model, optimizer.optimizer, epoch, train_loss, val_loss)
@@ -272,10 +292,9 @@ class Trainer:
     def dataset_loss(self, loss, data_loader):
         total_loss = 0.0
         for i, (imgs, targets) in enumerate(data_loader):
-            targets = [target.to(self.model.device).data for target in targets]
             with torch.no_grad():
-                predictions = self.base_model(self.model.preprocess(imgs))
-                total_loss += loss(self.base_model, predictions, targets)
+                predictions, targets = self.model.train_process(imgs, targets)
+                total_loss += loss(predictions, targets, "batch_val_loss")
         return total_loss / len(data_loader)
 
     def _close_mosaic(self):
@@ -296,6 +315,7 @@ class Trainer:
     def base_model(self):
         return self.model.model.model
 
+
 if __name__ == '__main__':
-    model = YOLO("models/fire.pt")
+    model = YOLO("models/yolov5m.pt", device_id=0)
     model.train("train_fire.yaml")

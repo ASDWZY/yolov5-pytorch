@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 from matplotlib import pyplot as plt
 
-from yolov5.utils import LOGGER
+from . import LOGGER
 
 
 def clip(x, xmin, xmax):
@@ -61,13 +61,17 @@ class Image:
         return self.data
 
     @classmethod
-    def read(cls, path: str):
+    def read(cls, path: str, gray=False):
         if not os.path.isfile(path):
             return "not exists"
-        data = cv2.imread(path)
-        if isinstance(data, np.ndarray):
-            return Image(data, False)
-        return "not img"
+        if gray:
+            data = cv2.imread(path, 0)
+            data = data.view(data.shape[0], data.shape[1], 1)
+        else:
+            data = cv2.imread(path)
+        if data is None:
+            return "not img"
+        return Image(data, False)
 
     def copy(self):
         return Image(self.data.copy(), self.rgb)
@@ -210,6 +214,7 @@ class VideoCapture:
             self.video = Video(src, ffmpeg=ffmpeg)
         else:
             self.video = cv2.VideoCapture(src)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.display_width)
 
     def read(self):
         ret, frame = self.video.read()

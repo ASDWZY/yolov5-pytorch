@@ -3,18 +3,21 @@ import numpy as np
 from abc import ABC, abstractmethod
 from utils import LOGGER, check_packages, Timer, load_yaml
 from utils.image import Image
-from utils.box import Boxes, NumpyBoxes
+from utils.box import NumpyBoxes, squeeze_with_indices
 from typing import Tuple, Union, List, Iterator
 from functools import wraps
 
-requirements = check_packages(["torch", "onnxruntime", "tensorrt"])
+requirements = check_packages(["torch", "onnxruntime", "tensorrt", "matplotlib"])
 
 if requirements["torch"]:
     import torch
-    from models.yolo import yolov5
+    from torch import nn
+    from models.yolo import DetectionModel
+    from utils.box import Boxes
 else:
     LOGGER.warning("Please install torch.")
-import matplotlib.pyplot as plt
+if requirements["matplotlib"]:
+    import matplotlib.pyplot as plt
 
 ImagesTyping = Union[Tuple[Image], List[Image]]
 
@@ -42,7 +45,7 @@ class ImageResult:
     def plot(self, colors=None, label_color="w", thickness: int = 2, show=True):
         fig = plt.imshow(self.origin_img.rgb_data)
         if colors is None:
-            colors = ["g"]*len(self.names)
+            colors = ["g"] * len(self.names)
         self.boxes.plot(fig.axes, self.names, colors, label_color, thickness)
         if show:
             plt.show()
@@ -73,10 +76,6 @@ class ImageResult:
                 color = tuple([int(c * 255) for c in color])
             colors.append(color)
         return colors
-
-    @property
-    def boxes_data(self):
-        return torch.stack([box.data for box in self.boxes], dim=0) if self.boxes else torch.empty((0, 6))
 
 
 class VideoResult:
@@ -257,8 +256,68 @@ class TorchModel(Model):
         if device_id is None:
             device_id = 0
         self.device = self.devices[device_id]
-        self.model, self.ckpt = yolov5(model, requires_ckpt=True)
+        if model.endswith(".yaml"):
+            self.ckpt = {}
+            self.model = DetectionModel(model)
+        elif model.endswith(".pt"):
+            self.ckpt = torch.load(model, map_location="cpu")
+            self.model = self.ckpt.pop("model")
+        else:
+            LOGGER.Error("yolov5 model can only be created by yaml and pt file")
         self.model.eval().float().to(self.device)
+
+    @staticmethod
+    def _remove_weights(detect, no_new):
+        def remove(x, na, num_attr_old, num_attr_new):
+            news = []
+            for i in range(na):
+                idx = i * num_attr_old
+                news.append(x[idx: idx + num_attr_new])
+            return torch.cat(news, dim=0)
+
+        no_old = detect.no
+        detect.no = no_new
+        for m in detect.m:
+            m.out_channels = detect.no * detect.na
+
+            weights = m.weight.data
+            bias = m.bias.data
+            m.weight = nn.Parameter(remove(weights, detect.na, no_old, detect.no))
+            m.bias = nn.Parameter(remove(bias, detect.na, no_old, detect.no))
+        return detect
+
+    @staticmethod
+    def _add_weights(detect, no_new):
+        detect.no = no_new
+        channels = detect.no * detect.na
+        for i in range(len(detect.m)):
+            detect.m[i].out_channels = channels
+
+            weights = detect.m[i].weight.data
+            bias = detect.m[i].bias.data
+            shape = weights.shape
+
+            new_weights = torch.cat(
+                (weights, torch.normal(0, 0.01, (channels - shape[0], *shape[1:]), device=weights.device)),
+                dim=0)
+            new_bias = torch.cat((bias, torch.zeros((channels - shape[0]), device=weights.device)), dim=0)
+            detect.m[i].weight = nn.Parameter(new_weights)
+            detect.m[i].bias = nn.Parameter(new_bias)
+        return detect
+
+    def attempt_reset_nc(self, num_classes):
+        detect = self.model.model[-1]
+        if detect.nc == num_classes:
+            return
+        no_new = num_classes + 5
+        old_nc = detect.nc
+        detect.nc = num_classes
+        if old_nc > num_classes:
+            detect = self._remove_weights(detect, no_new)
+        else:
+            detect = self._add_weights(detect, no_new)
+        self.model.model[-1] = detect
+        LOGGER.warning(f"Reset num_classes from {old_nc} to {num_classes}, now model.model[-1]={detect}")
 
     @timer_method
     def preprocess(self, imgs: ImagesTyping, imgsz: int):
@@ -346,25 +405,26 @@ class YOLO:
         except KeyError:
             LOGGER.Error(f"Unsupported model: {model}")
 
-        self.names = [] if names is None else names
-        self.yolo_type = yolo_type
+        self.names = names
+        # if len(self.names) != self["nc"]:
+        #     LOGGER.warning("nc")
         self.imgsz = imgsz
         self.conf_thresh = conf_thresh
         self.nms_thresh = nms_thresh
 
     def eval_mode(self):
-        if type(self.model) == TorchModel:
+        if self.is_torch:
             self.model.eval()
 
     def train_mode(self):
-        if type(self.model) == TorchModel:
+        if self.is_torch:
             self.model.train()
 
     def warmup(self, num_warmups=1):
         self.model.warmup(self.imgsz, num_warmups)
 
     def train(self, cfg: Union[str, dict], freeze_epochs=0, resume=False):
-        if type(self.model) != TorchModel:
+        if not self.is_torch:
             LOGGER.Error(f"Only TorchModel could train.")
         self.model.train()
         from train import Trainer
@@ -373,16 +433,32 @@ class YOLO:
         trainer = Trainer(self, cfg)
         trainer.train(freeze_epochs, resume)
 
+    def reset_num_classes(self, num_classes=None):
+        if num_classes is None:
+            num_classes = len(self.names)
+        self.model.attempt_reset_nc(num_classes)
+
+    def init_weights(self):
+        if not self.is_torch:
+            LOGGER.Error(f"Only TorchModel could init_weights.")
+        self.model.model.init_weights()
+
     def preprocess(self, imgs: ImagesTyping):
         return self.model.preprocess([img.to_rgb() for img in imgs], self.imgsz)
 
     def inference(self, x):
         return self.model.inference(x)
 
-    def forward(self, x):
-        if not hasattr(self.model, "forward"):
+    def forward(self, imgs: ImagesTyping):
+        if not self.is_torch:
             LOGGER.Error("Only TorchModel could forward in training.")
-        return self.model.forward(x)
+        return self.model.forward(self.model.preprocess([img.to_rgb() for img in imgs], self.imgsz))
+
+    def train_process(self, imgs: ImagesTyping, target_boxes: List[Boxes]):
+        for x, img in zip(target_boxes, imgs):
+            x.letterbox(img.shape[:2], self.imgsz)
+            x.to(self.device)
+        return self.forward(imgs), squeeze_with_indices(target_boxes)
 
     def postprocess(self, pred, img_shapes=None):
         return self.model.postprocess(pred, self.imgsz, img_shapes, self.conf_thresh, self.nms_thresh)
@@ -397,8 +473,6 @@ class YOLO:
     def detect_video(self, src):
         video = cv2.VideoCapture(src)
         fps = int(video.get(cv2.CAP_PROP_FPS))
-        # width = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
-        # height = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
 
         def detect_generator(video):
@@ -433,14 +507,58 @@ class YOLO:
     def device(self):
         return self.model.device if hasattr(self.model, "device") else None
 
+    @property
+    def is_training(self):
+        if type(self.model) == TorchModel:
+            return self.model.is_training
+        return False
+
+    @property
+    def is_torch(self):
+        return type(self.model) == TorchModel
+
+    def _getitem(self, item):
+        if not self.is_torch:
+            raise KeyError(str(item))
+        return getattr(self.model.model.model[-1], item)
+
+    def _setitem(self, key, value):
+        if not self.is_torch:
+            raise KeyError(str(key))
+        return setattr(self.model.model.model[-1], key, value)
+
+    def get_num_layers(self):
+        return self._getitem("nl")
+
+    def get_strides(self):
+        return self._getitem("stride")
+
+    def get_anchors(self):
+        anchors = self._getitem("anchors")
+        return anchors * self.get_strides().reshape(anchors.shape[0], 1, 1)
+
+    def set_anchors(self, anchors):
+        if type(anchors) != torch.tensor:
+            anchors = torch.tensor(anchors, device=self.device)
+        if len(anchors.shape) != 3:
+            raise NotImplementedError("anchors must be 3D")
+        if anchors.shape[0] != self.get_num_layers():
+            raise NotImplementedError("Please reset num_layers first")
+        if anchors.shape[2] != 2:
+            raise NotImplementedError("anchors.shape[2] must be 2")
+        self._setitem("anchors", anchors)
+        self._setitem("na", anchors.shape[1])
+
 
 if __name__ == '__main__':
+    img = Image.read("imgs/0.jpg")
+    model = YOLO("models/yolov5m.pt", names=["fire", "smoke"], device_id=0)
+    # model.model.attempt_reset_nc(1)
 
-    # img = Image.read("imgs/fire.jpg")
-    model = YOLO("best.pt", names=["fire", "smoke"], device_id=0)
-    # pred = model(img)
-    # frame = pred.draw(model.names)
-    # frame.plot()
+    pred = model(img)
+    print(pred)
+    frame = pred.draw()
+    frame.plot()
 
-    pred = model.detect_video("fires.mp4")
-    pred.write("result.mp4", seconds=20)
+    # pred = model.detect_video("fires.mp4")
+    # pred.write("result.mp4", seconds=20)

@@ -146,20 +146,17 @@ class YoloOptimizer:
             self.epoch = start_epoch
             LOGGER.info(f"Resuming YoloOptimizer with epoch={start_epoch}")
 
-    def optimize(self, callback, model, data_iter, batch_size):
-        total_loss = 0.0
-        for data in data_iter:
+    def optimize(self, loss_iter, model, batch_size):
+        for loss in loss_iter:
+            self.grad_accumulator.step(model, self.optimizer, loss, self.trained_batches, self.nbs)
+            if self.ema is not None:
+                self.ema.update(model)
+
             self.optimizer.zero_grad()
             lr_now = self.scheduler.get_lr_now(self.epoch)
             self.warmup_monitor.step(self.optimizer, lr_now, self.momentum, batch_size)
-            loss = callback(*data)
-            total_loss += loss.data
-            self.grad_accumulator.step(model, self.optimizer, loss.sum(), self.trained_batches, self.nbs)
-            if self.ema is not None:
-                self.ema.update(model)
         self.scheduler.step()
         self.epoch += 1
-        return total_loss
 
     @property
     def trained_batches(self):
